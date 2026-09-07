@@ -1,0 +1,96 @@
+name: Send a Pushover message
+
+# A push notification on demand, optionally after a delay.
+#
+# Triggered by hand (Actions -> Send a Pushover message -> Run workflow), or by
+# anything that can dispatch a workflow. Unlike a "schedule:" trigger, a manual
+# dispatch starts within seconds, which makes a short delay actually meaningful.
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: "Message body"
+        required: false
+        default: "Good afternoon!"
+      title:
+        description: "Notification title"
+        required: false
+        default: "Good afternoon"
+      delay_seconds:
+        description: "Wait this many seconds before sending (0-3600)"
+        required: false
+        default: "180"
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    # The job sits idle while it waits, so cap it well clear of the longest
+    # delay we allow; without this a stuck runner could hang for six hours.
+    timeout-minutes: 70
+    steps:
+      - name: Check the secrets are present
+        env:
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+        run: |
+          missing=""
+          [ -z "$PUSHOVER_TOKEN" ] && missing="$missing PUSHOVER_TOKEN"
+          [ -z "$PUSHOVER_USER" ] && missing="$missing PUSHOVER_USER"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing secret(s):$missing"
+            echo "Add them under Settings -> Secrets and variables -> Actions."
+            echo "PUSHOVER_TOKEN is the application API token from https://pushover.net/apps/build"
+            echo "PUSHOVER_USER is the user key from the front page of https://pushover.net"
+            exit 1
+          fi
+          echo "Both secrets are set."
+
+      # Checked before waiting, so a bad number fails now rather than in an hour.
+      - name: Wait
+        env:
+          DELAY: ${{ inputs.delay_seconds }}
+        run: |
+          case "$DELAY" in
+            ''|*[!0-9]*)
+              echo "::error::delay_seconds must be a whole number, got '$DELAY'"
+              exit 1 ;;
+          esac
+          if [ "$DELAY" -gt 3600 ]; then
+            echo "::error::delay_seconds is capped at 3600 (one hour), got $DELAY"
+            exit 1
+          fi
+
+          if [ "$DELAY" -gt 0 ]; then
+            echo "Waiting ${DELAY}s. Sending at about $(date -u -d "+${DELAY} seconds" +%H:%M:%S) UTC" \
+                 "($(TZ=Europe/London date -d "+${DELAY} seconds" +"%H:%M:%S %Z") in London)."
+            sleep "$DELAY"
+          fi
+
+      - name: Send it
+        env:
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          TITLE: ${{ inputs.title }}
+          MESSAGE: ${{ inputs.message }}
+        run: |
+          # --form-string rather than -F, so a value beginning with @ or < is
+          # sent as text instead of being treated as a filename to read.
+          # Secrets are passed via env so they never appear in the command line.
+          curl --silent --show-error --fail-with-body \
+            --form-string "token=$PUSHOVER_TOKEN" \
+            --form-string "user=$PUSHOVER_USER" \
+            --form-string "title=$TITLE" \
+            --form-string "message=$MESSAGE" \
+            https://api.pushover.net/1/messages.json | tee response.json
+          echo
+
+          # Pushover answers 200 with {"status":1,...} on success. A rejected
+          # token gives 4xx, which --fail-with-body already turns into failure,
+          # but check the body too rather than trusting the status code alone.
+          if grep -q '"status":1' response.json; then
+            echo "Sent at $(TZ=Europe/London date +"%H:%M:%S %Z")."
+          else
+            echo "::error::Pushover did not accept the message. Response above."
+            exit 1
+          fi
